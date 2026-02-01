@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Star Snatch (2P)</title>
+  <style>
+    html, body { margin:0; height:100%; background:#0b1020; overflow:hidden; }
+    canvas { display:block; width:100vw; height:100vh; }
+    .hud {
+      position: fixed; left: 12px; top: 12px; color: #eaf0ff;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      background: rgba(0,0,0,.35); padding: 10px 12px; border-radius: 12px;
+      backdrop-filter: blur(6px);
+      line-height: 1.35;
+      max-width: 520px;
+    }
+    .hud b { color: #fff; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; }
+    .pill {
+      display:inline-flex; align-items:center; gap:6px;
+      background: rgba(255,255,255,.08);
+      padding: 4px 8px; border-radius: 999px;
+    }
+    .small { opacity:.85; font-size: 12px; }
+    .controls { margin-top: 8px; }
+    input {
+      width: 260px; padding: 6px 8px; border-radius: 10px; border: 1px solid rgba(255,255,255,.18);
+      background: rgba(0,0,0,.25); color: #eaf0ff; outline: none;
+    }
+    button {
+      padding: 7px 10px; border-radius: 10px; border: 0;
+      background: rgba(255,255,255,.14); color: #eaf0ff; cursor: pointer;
+    }
+    button:hover { background: rgba(255,255,255,.20); }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+
+  <div class="hud">
+    <div class="row">
+      <span class="pill">Mode: <b id="mode">Local</b></span>
+      <span class="pill">Stars to win: <b id="win">20</b></span>
+      <span class="pill">Ping: <b id="ping">—</b></span>
+    </div>
+
+    <div class="controls">
+      <div class="small">Online: run the server below, then put its URL here (example: <b>ws://localhost:8080</b>), and share your public URL with your gf.</div>
+      <div class="row" style="margin-top:6px;">
+        <input id="wsUrl" placeholder="ws://localhost:8080" />
+        <button id="connectBtn">Connect</button>
+        <button id="localBtn">Local</button>
+      </div>
+      <div class="small" style="margin-top:8px;">
+        <b>P1</b>: WASD + Shift dash • <b>P2</b>: Arrow keys + / dash
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+
+  const modeEl = document.getElementById("mode");
+  const pingEl = document.getElementById("ping");
+  const wsUrlEl = document.getElementById("wsUrl");
+  const connectBtn = document.getElementById("connectBtn");
+  const localBtn = document.getElementById("localBtn");
+
+  // ---------- Utilities ----------
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const len = (x,y) => Math.hypot(x,y);
+  const rnd = (a,b) => a + Math.random()*(b-a);
+
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.floor(innerWidth * dpr);
+    canvas.height = Math.floor(innerHeight * dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0); // draw in CSS pixels
+  }
+  addEventListener("resize", resize);
+  resize();
+
+  // ---------- Game state ----------
+  const WIN_SCORE = 20;
+
+  const state = {
+    t: 0,
+    stars: [],
+    lastStarId: 0,
+    score: [0,0],
+    winner: null,
+  };
+
+  function spawnStar() {
+    const margin = 50;
+    const s = {
+      id: ++state.lastStarId,
+      x: rnd(margin, innerWidth - margin),
+      y: rnd(margin, innerHeight - margin),
+      r: rnd(8, 14),
+      pulse: rnd(0, Math.PI*2),
+    };
+    state.stars.push(s);
+  }
+
+  // Start with a few stars
+  for (let i=0;i<6;i++) spawnStar();
+
+  // ---------- Players ----------
+  function makePlayer(i) {
+    return {
+      id: i,
+      x: innerWidth*(i?0.7:0.3),
+      y: innerHeight*0.5,
+      vx: 0,
+      vy: 0,
+      r: 16,
+      dashCooldown: 0,
+      dashTime: 0,
+      facing: i?Math.PI:0,
+    };
+  }
+
+  const players = [makePlayer(0), makePlayer(1)];
+
+  // ---------- Input ----------
+  const keys = new Set();
+  addEventListener("keydown", e => { keys.add(e.key); });
+  addEventListener("keyup", e => { keys.delete(e.key); });
+
+  function inputFor(playerIndex) {
+    // Returns desired acceleration vector and dash intent
+    let ax=0, ay=0, dash=false;
+
+    if (playerIndex === 0) {
+      if (keys.has("w") || keys.has("W")) ay -= 1;
+      if (keys.has("s") || keys.has("S")) ay += 1;
+      if (keys.has("a") || keys.has("A")) ax -= 1;
+      if (keys.has("d") || keys.has("D")) ax += 1;
+      dash = keys.has("Shift");
+    } else {
+      if (keys.has("ArrowUp")) ay -= 1;
+      if (keys.has("ArrowDown")) ay += 1;
+      if (keys.has("ArrowLeft")) ax -= 1;
+      if (keys.has("ArrowRight")) ax += 1;
+      dash = keys.has("/");
+    }
+
+    const m = Math.hypot(ax,ay) || 1;
+    return { ax: ax/m, ay: ay/m, dash };
+  }
+
+  // ---------- Local physics ----------
+  function stepLocal(dt) {
+    const ACC = 900;      // px/s^2
+    const DRAG = 4.5;     // higher = more friction
+    const MAXS = 380;     // px/s
+    const DASH_SPEED = 800;
+    const DASH_DURATION = 0.12;
+    const DASH_COOLDOWN = 0.65;
+
+    for (let i=0;i<players.length;i++) {
+      const p = players[i];
+      const inp = inputFor(i);
+
+      // dash logic
+      p.dashCooldown = Math.max(0, p.dashCooldown - dt);
+      p.dashTime = Math.max(0, p.dashTime - dt);
+
+      if (inp.dash && p.dashCooldown === 0 && p.dashTime === 0) {
+        // dash in facing direction or input direction
+        let dx = inp.ax, dy = inp.ay;
+        if (dx === 0 && dy === 0) { dx = Math.cos(p.facing); dy = Math.sin(p.facing); }
+        p.vx = dx * DASH_SPEED;
+        p.vy = dy * DASH_SPEED;
+        p.dashTime = DASH_DURATION;
+        p.dashCooldown = DASH_COOLDOWN;
+      }
+
+      // facing
+      if (inp.ax !== 0 || inp.ay !== 0) p.facing = Math.atan2(inp.ay, inp.ax);
+
+      // acceleration (weakened during dash time)
+      const dashFactor = p.dashTime > 0 ? 0.25 : 1.0;
+      p.vx += inp.ax * ACC * dashFactor * dt;
+      p.vy += inp.ay * ACC * dashFactor * dt;
+
+      // drag
+      p.vx -= p.vx * DRAG * dt;
+      p.vy -= p.vy * DRAG * dt;
+
+      // clamp speed
+      const sp = Math.hypot(p.vx, p.vy);
+      if (sp > MAXS && p.dashTime <= 0) {
+        p.vx = p.vx / sp * MAXS;
+        p.vy = p.vy / sp * MAXS;
+      }
+
+      // integrate
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+
+      // bounds bounce
+      const pad = p.r + 6;
+      if (p.x < pad) { p.x = pad; p.vx *= -0.45; }
+      if (p.x > innerWidth - pad) { p.x = innerWidth - pad; p.vx *= -0.45; }
+      if (p.y < pad) { p.y = pad; p.vy *= -0.45; }
+      if (p.y > innerHeight - pad) { p.y = innerHeight - pad; p.vy *= -0.45; }
+    }
+
+    // collect stars
+    for (let si = state.stars.length - 1; si >= 0; si--) {
+      const s = state.stars[si];
+      for (let pi=0; pi<players.length; pi++) {
+        const p = players[pi];
+        if (len(p.x - s.x, p.y - s.y) < p.r + s.r) {
+          state.stars.splice(si,1);
+          state.score[pi] += 1;
+          if (state.score[pi] >= WIN_SCORE) state.winner = pi;
+          spawnStar();
+          spawnStar(); // keep action high
+          break;
+        }
+      }
+    }
+  }
+
+  // ---------- Online multiplayer (very simple) ----------
+  // Server acts as an "authoritative relay":
+  // - each client sends its input (ax, ay, dash, seq)
+  // - server simulates whole game and broadcasts snapshots
+  let ws = null;
+  let online = false;
+  let mySlot = null;
+  let lastPingSentAt = 0;
+  let pingMs = null;
+
+  function setMode(isOnline) {
+    online = isOnline;
+    modeEl.textContent = online ? "Online" : "Local";
+    pingEl.textContent = online ? (pingMs == null ? "…" : `${Math.round(pingMs)}ms`) : "—";
+  }
+
+  function connect(url) {
+    try { ws?.close(); } catch {}
+    ws = new WebSocket(url);
+
+    ws.onopen = () => {
+      setMode(true);
+      ws.send(JSON.stringify({ type: "hello" }));
+    };
+
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+
+      if (msg.type === "slot") {
+        mySlot = msg.slot; // 0 or 1
+      }
+
+      if (msg.type === "snapshot") {
+        // overwrite local state from server snapshot
+        state.t = msg.t;
+        state.stars = msg.stars;
+        state.score = msg.score;
+        state.winner = msg.winner;
+
+        for (let i=0;i<2;i++) {
+          players[i].x = msg.players[i].x;
+          players[i].y = msg.players[i].y;
+          players[i].vx = msg.players[i].vx;
+          players[i].vy = msg.players[i].vy;
+          players[i].facing = msg.players[i].facing;
+          players[i].dashCooldown = msg.players[i].dashCooldown;
+          players[i].dashTime = msg.players[i].dashTime;
+        }
+      }
+
+      if (msg.type === "pong") {
+        pingMs = performance.now() - msg.sentAt;
+        pingEl.textContent = `${Math.round(pingMs)}ms`;
+      }
+    };
+
+    ws.onclose = () => {
+      ws = null;
+      mySlot = null;
+      pingMs = null;
+      setMode(false);
+    };
+
+    ws.onerror = () => {
+      // fall back to local if connection fails
+      ws?.close();
+    };
+  }
+
+  function sendInput() {
+    if (!online || !ws || ws.readyState !== 1 || mySlot == null) return;
+    const inp = inputFor(mySlot);
+    ws.send(JSON.stringify({ type: "input", slot: mySlot, ax: inp.ax, ay: inp.ay, dash: inp.dash }));
+  }
+
+  // ---------- Rendering ----------
+  function draw() {
+    // background
+    ctx.clearRect(0,0,innerWidth, innerHeight);
+
+    // subtle starfield
+    ctx.globalAlpha = 0.18;
+    for (let i=0;i<80;i++) {
+      const x = (i*97 + state.t*15) % innerWidth;
+      const y = (i*193 + state.t*7) % innerHeight;
+      ctx.fillRect(x, y, 2, 2);
+    }
+    ctx.globalAlpha = 1;
+
+    // stars
+    for (const s of state.stars) {
+      const pulse = 0.35 + 0.65 * (0.5 + 0.5*Math.sin(state.t*2 + s.pulse));
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.r * (0.9 + 0.15*pulse), 0, Math.PI*2);
+      ctx.fillStyle = "rgba(255, 240, 170, 0.95)";
+      ctx.fill();
+
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.r * 2.1, 0, Math.PI*2);
+      ctx.strokeStyle = "rgba(255, 240, 170, 0.12)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    // players
+    const colors = ["rgba(120, 200, 255, 1)", "rgba(255, 140, 200, 1)"];
+    for (let i=0;i<2;i++) {
+      const p = players[i];
+
+      // glow
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r*2.2, 0, Math.PI*2);
+      ctx.fillStyle = colors[i].replace("1)", "0.10)");
+      ctx.fill();
+
+      // body
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+      ctx.fillStyle = colors[i];
+      ctx.fill();
+
+      // facing nub
+      ctx.beginPath();
+      ctx.arc(p.x + Math.cos(p.facing)*p.r*0.9, p.y + Math.sin(p.facing)*p.r*0.9, 5, 0, Math.PI*2);
+      ctx.fillStyle = "rgba(255,255,255,0.9)";
+      ctx.fill();
+
+      // dash ring
+      if (p.dashCooldown > 0) {
+        const cd = clamp(p.dashCooldown / 0.65, 0, 1);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r+8, -Math.PI/2, -Math.PI/2 + (1-cd)*Math.PI*2);
+        ctx.strokeStyle = "rgba(255,255,255,0.35)";
+        ctx.lineWidth = 3;
+        ctx.stroke();
+      }
+    }
+
+    // scores
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    ctx.font = "700 18px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial";
+    ctx.fillText(`P1: ${state.score[0]}`, 12, innerHeight - 18);
+    ctx.fillText(`P2: ${state.score[1]}`, 110, innerHeight - 18);
+
+    // winner
+    if (state.winner != null) {
+      ctx.save();
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.fillRect(0,0,innerWidth, innerHeight);
+      ctx.fillStyle = "rgba(255,255,255,0.95)";
+      ctx.font = "800 44px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial";
+      ctx.textAlign = "center";
+      ctx.fillText(`PLAYER ${state.winner+1} WINS!`, innerWidth/2, innerHeight/2 - 10);
+      ctx.font = "500 16px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial";
+      ctx.fillText(`Press R to restart`, innerWidth/2, innerHeight/2 + 26);
+      ctx.restore();
+    }
+  }
+
+  function resetGame() {
+    state.t = 0;
+    state.stars = [];
+    state.lastStarId = 0;
+    state.score = [0,0];
+    state.winner = null;
+    players[0] = Object.assign(players[0], makePlayer(0));
+    players[1] = Object.assign(players[1], makePlayer(1));
+    for (let i=0;i<6;i++) spawnStar();
+  }
+
+  addEventListener("keydown", (e) => {
+    if ((e.key === "r" || e.key === "R") && state.winner != null) {
+      if (!online) resetGame();
+      // online: server will handle restart, keep it simple for now
+    }
+  });
+
+  // ---------- Main loop ----------
+  let last = performance.now();
+  function loop(now) {
+    const dt = clamp((now - last) / 1000, 0, 1/20);
+    last = now;
+    state.t += dt;
+
+    // send periodic ping
+    if (online && ws && ws.readyState === 1) {
+      if (now - lastPingSentAt > 1000) {
+        lastPingSentAt = now;
+        ws.send(JSON.stringify({ type: "ping", sentAt: now }));
+      }
+      sendInput();
+    }
+
+    if (!online) {
+      if (state.winner == null) stepLocal(dt);
+    }
+
+    draw();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  // UI buttons
+  connectBtn.onclick = () => {
+    const url = wsUrlEl.value.trim();
+    if (!url) return;
+    connect(url);
+  };
+
+  localBtn.onclick = () => {
+    try { ws?.close(); } catch {}
+    ws = null;
+    mySlot = null;
+    pingMs = null;
+    setMode(false);
+    resetGame();
+  };
+
+  setMode(false);
+})();
+</script>
+</body>
+</html>

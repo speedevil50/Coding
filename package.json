@@ -1,0 +1,21 @@
+{
+  "name": "coding",
+  "version": "1.0.0",
+  "description": "a Public Repo of all my publicly released scripts that i made",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/speedevil50/Coding.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/speedevil50/Coding/issues"
+  },
+  "homepage": "https://github.com/speedevil50/Coding#readme"
+}
